@@ -14,6 +14,8 @@ import os
 import re
 import string
 import time
+import multiprocessing as mp
+import tempfile
 from collections import defaultdict
 from io import BytesIO
 from pathlib import Path
@@ -188,6 +190,151 @@ def dataset_row_frame_file(row: Any) -> str:
     shot_number = row.get("Shot_Number")
     frame_type = row.get("Frame_Type", "Unknown")
     return f"{frame_type}_scene_{scene_number}_shot_{shot_number}.jpg"
+
+
+def estimate_gpus_needed(model_name: str) -> int:
+    """Estimate how many GPUs a model needs based on its name."""
+    name = (model_name or "").lower()
+    match = re.search(r"(\d+)[bB]", name)
+    if match:
+        billions = int(match.group(1))
+        if billions <= 8:
+            return 1  # 7B/8B fits on 1 GPU
+        if billions <= 15:
+            return 2  # 13B/15B needs 2 GPUs
+        if billions <= 34:
+            return 4  # 34B needs 4 GPUs
+        return 8  # 70B+ needs 8 GPUs
+    return 1  # Default: assume small model
+
+
+def _chunk_round_robin(items: list[Any], num_chunks: int) -> list[list[Any]]:
+    chunks: list[list[Any]] = [[] for _ in range(max(1, num_chunks))]
+    for i, item in enumerate(items):
+        chunks[i % len(chunks)].append(item)
+    return chunks
+
+
+def _vllm_parallel_plan(vllm_model: str) -> tuple[int, int, int]:
+    """Return (num_workers, gpus_needed, num_gpus) for vLLM auto parallelism."""
+    import torch
+
+    num_gpus = torch.cuda.device_count()
+    if num_gpus <= 0:
+        num_gpus = 1
+    gpus_needed = estimate_gpus_needed(vllm_model)
+    gpus_needed = max(1, min(gpus_needed, num_gpus))
+    if gpus_needed >= num_gpus:
+        # Tensor parallel across all available GPUs
+        return 1, gpus_needed, num_gpus
+    # Data parallel: multiple workers, each a TP group of size gpus_needed
+    num_workers = max(1, num_gpus // gpus_needed)
+    return num_workers, gpus_needed, num_gpus
+
+
+def _merge_tmp_csvs(final_path: Path, tmp_paths: list[Path], *, resume: bool) -> None:
+    """Merge worker CSVs into final output, writing header once."""
+    if not tmp_paths:
+        return
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    open_mode = "a" if resume and final_path.exists() else "w"
+    with final_path.open(open_mode, newline="", encoding="utf-8") as out_f:
+        out_wrote_header = resume and final_path.exists()
+        w = csv.writer(out_f)
+        for p in tmp_paths:
+            with p.open(newline="", encoding="utf-8") as in_f:
+                r = csv.reader(in_f)
+                try:
+                    header = next(r)
+                except StopIteration:
+                    continue
+                if not out_wrote_header:
+                    w.writerow(header)
+                    out_wrote_header = True
+                for row in r:
+                    w.writerow(row)
+
+
+def _run_local_vllm_worker(
+    gpu_ids: list[int],
+    items: list[tuple[str, str, str]],
+    vllm_model_name: str,
+    tp_size: int,
+    tmp_csv: str,
+    caption_mode_flag: bool,
+) -> None:
+    """Worker for vLLM local-mode data parallelism."""
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
+    from vllm import LLM
+
+    llm_instance = LLM(
+        model=vllm_model_name,
+        max_model_len=4096,
+        limit_mm_per_prompt={"image": 1},
+        trust_remote_code=True,
+        tensor_parallel_size=tp_size,
+    )
+
+    image_prompt = "What movie is this frame from? Reply with only the movie title, nothing else."
+    with Path(tmp_csv).open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if caption_mode_flag:
+            writer.writerow(
+                ["movie", "frame_type", "frame_file", "llm", "caption", "llm_response", "correct"]
+            )
+        else:
+            writer.writerow(["movie", "frame_type", "frame_file", "llm", "llm_response", "correct"])
+
+        for idx, (m_name, f_type, f_path_str) in enumerate(items, start=1):
+            frame_path = Path(f_path_str)
+            print(
+                f"[worker {os.environ.get('CUDA_VISIBLE_DEVICES','?')}] {idx}/{len(items)} {frame_path.name}"
+            )
+            caption = ""
+            try:
+                img = Image.open(frame_path)
+            except Exception as e:  # noqa: BLE001
+                if caption_mode_flag:
+                    caption = f"ERROR: Failed to open image {frame_path}: {e}"
+                    llm_response = "ERROR: caption step failed"
+                else:
+                    llm_response = f"ERROR: Failed to open image {frame_path}: {e}"
+                correct = False
+            else:
+                if caption_mode_flag:
+                    caption, cap_err = call_llm_with_status(
+                        "vllm",
+                        CAPTION_IMAGE_PROMPT,
+                        img,
+                        vllm_instance=llm_instance,
+                        vllm_model=vllm_model_name,
+                        vllm_max_tokens=1024,
+                    )
+                    if cap_err:
+                        llm_response = "ERROR: caption step failed"
+                        correct = False
+                    else:
+                        guess_prompt = guess_from_caption_prompt(caption)
+                        llm_response, guess_err = call_llm_text_with_status(
+                            "vllm",
+                            guess_prompt,
+                            vllm_instance=llm_instance,
+                        )
+                        correct = False if guess_err else is_correct_response(llm_response, m_name)
+                else:
+                    llm_response, had_error = call_llm_with_status(
+                        "vllm",
+                        image_prompt,
+                        img,
+                        vllm_instance=llm_instance,
+                        vllm_model=vllm_model_name,
+                    )
+                    correct = False if had_error else is_correct_response(llm_response, m_name)
+
+            if caption_mode_flag:
+                writer.writerow([m_name, f_type, frame_path.name, "vllm", caption, llm_response, str(correct)])
+            else:
+                writer.writerow([m_name, f_type, frame_path.name, "vllm", llm_response, str(correct)])
 
 
 def encode_image_to_base64(img: Image.Image) -> str:
@@ -532,6 +679,59 @@ def run_local(
     if n_done > 0:
         print(f"Found existing results: {n_done}/{total} frames already processed. Resuming...")
 
+    num_workers = 1
+    gpus_needed = 1
+    num_gpus = 1
+
+    # vLLM: auto decide tensor parallelism vs data parallelism
+    if llm == "vllm":
+        assert vllm_model is not None
+        num_workers, gpus_needed, num_gpus = _vllm_parallel_plan(vllm_model)
+        if gpus_needed >= num_gpus:
+            print(
+                f"vLLM: model needs {gpus_needed} GPU(s), using tensor parallelism across {num_gpus} GPU(s)"
+            )
+        else:
+            print(
+                f"vLLM: model fits on {gpus_needed} GPU(s), launching {num_workers} data-parallel workers across {num_gpus} GPU(s)"
+            )
+
+        if num_workers > 1:
+            work_items: list[tuple[str, str, str]] = [
+                (movie_name, frame_type, str(frame_path)) for (_, frame_type, frame_path) in remaining_frames
+            ]
+            chunks = _chunk_round_robin(work_items, num_workers)
+
+            gpu_groups: list[list[int]] = []
+            for w in range(num_workers):
+                start = w * gpus_needed
+                gpu_groups.append(list(range(start, start + gpus_needed)))
+
+            with tempfile.TemporaryDirectory(prefix="disco_vllm_local_", dir=str(output.parent)) as td:
+                tmp_paths: list[Path] = []
+                procs: list[mp.Process] = []
+                ctx = mp.get_context("spawn")
+                for wi, (gpu_ids, items) in enumerate(zip(gpu_groups, chunks, strict=False)):
+                    tmp = Path(td) / f"worker_{wi}.csv"
+                    tmp_paths.append(tmp)
+                    p = ctx.Process(
+                        target=_run_local_vllm_worker,
+                        args=(gpu_ids, items, vllm_model, gpus_needed, str(tmp), caption_mode),
+                    )
+                    p.start()
+                    procs.append(p)
+
+                for p in procs:
+                    p.join()
+
+                bad = [p.exitcode for p in procs if p.exitcode not in (0, None)]
+                if bad:
+                    raise RuntimeError(f"One or more vLLM worker processes failed: exit codes={bad}")
+
+                resume = n_done > 0
+                _merge_tmp_csvs(output, tmp_paths, resume=resume)
+            return
+
     vllm_instance: Any = None
     if llm == "vllm":
         from vllm import LLM
@@ -542,6 +742,7 @@ def run_local(
             max_model_len=4096,
             limit_mm_per_prompt={"image": 1},
             trust_remote_code=True,
+            tensor_parallel_size=num_gpus,
         )
 
     image_prompt = "What movie is this frame from? Reply with only the movie title, nothing else."
@@ -799,11 +1000,14 @@ def run_dataset(
             from vllm import LLM
 
             assert vllm_model is not None
+            _, _, num_gpus = _vllm_parallel_plan(vllm_model)
+            print(f"vLLM: using tensor parallelism across {num_gpus} GPU(s)")
             vllm_instance = LLM(
                 model=vllm_model,
                 max_model_len=4096,
                 limit_mm_per_prompt={"image": 1},
                 trust_remote_code=True,
+                tensor_parallel_size=num_gpus,
             )
 
         resume = n_done > 0
@@ -845,11 +1049,14 @@ def run_dataset(
             from vllm import LLM
 
             assert vllm_model is not None
+            _, _, num_gpus = _vllm_parallel_plan(vllm_model)
+            print(f"vLLM: using tensor parallelism across {num_gpus} GPU(s)")
             vllm_instance = LLM(
                 model=vllm_model,
                 max_model_len=4096,
                 limit_mm_per_prompt={"image": 1},
                 trust_remote_code=True,
+                tensor_parallel_size=num_gpus,
             )
 
         for mi, (movie_name, movie_indices, out_path, remaining) in enumerate(movie_jobs, start=1):
