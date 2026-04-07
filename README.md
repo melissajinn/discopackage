@@ -1,6 +1,6 @@
 ## discopackage (movie frame extraction + classification)
 
-This project extracts representative frames from a movie, deduplicates them with CLIP embeddings, then classifies frames into **main** (character-focused) vs **neutral** (faceless / background-y) selections. The **`run.py`** script runs the **DIS-CO** step: it asks a VLM to name the movie from each frame and writes results to CSV (cloud APIs or local **vLLM**). The **`compare.py`** script aggregates those CSVs and prints accuracy tables (compare LLMs or image vs caption).
+This project extracts representative frames from a movie, deduplicates them with CLIP embeddings, then classifies frames into **main** (character-focused) vs **neutral** (faceless / background-y) selections. The **`run.py`** script runs the **DIS-CO** step: it asks a VLM to name the movie from each frame and writes results to CSV (cloud APIs or local **vLLM**). The **`compare.py`** script aggregates those CSVs and prints accuracy tables (compare LLMs, image vs caption, or **leaderboard** rankings across all result files).
 
 ### What it does
 
@@ -143,6 +143,8 @@ export OPENAI_API_KEY="..."
 
 **Resume & checkpointing:** If the target CSV already exists, `run.py` reads it and **skips frames that already finished successfully**. A frame counts as done when the latest row for that `frame_file` has a non-empty `llm_response` that does **not** start with `ERROR:` (so failed/API rows are **retried**). New rows are **appended**; the header is not written again. You’ll see messages like `Found existing results: 85/140 frames already processed. Resuming...` or `All 140 frames already processed in {path}. Nothing to do.` For **dataset mode without `--movie`**, each per-movie file resumes independently—if a run stops on movie 30, rerunning picks up from movie 30’s file without redoing movies 1–29.
 
+**Dataset mode `frame_file` ids:** In **`--mode dataset`**, each row’s `frame_file` column is a stable id derived from **`Frame_Type`**, **`Scene_Number`**, and **`Shot_Number`**: `{Frame_Type}_scene_{Scene_Number}_shot_{Shot_Number}.jpg` (missing **`Frame_Type`** defaults to `Unknown`). The same scene/shot can appear twice (e.g. **Main** and **Neutral**); including **`Frame_Type`** keeps resume keys unique. **Resuming against an older CSV** that used only `scene_X_shot_Y.jpg` will not match those rows—finish the old run or use a new output file if you change formats mid-project.
+
 **Recommended vLLM models** (for movie-frame identification; strongest first):
 
 | Model | HuggingFace id | VRAM | Notes |
@@ -260,11 +262,13 @@ python3 run.py --mode dataset \
 
 **Caption mode (`--caption-mode`):** adds `caption` (generated description or dataset caption); `llm_response` is the movie guess from the text-only step. The filename uses `test_type` = `caption` (e.g. `frozen_dataset_caption_chatgpt.csv`).
 
+**Dataset mode:** `frame_file` is written as `{Frame_Type}_scene_{Scene_Number}_shot_{Shot_Number}.jpg` (see **Resume & checkpointing** above).
+
 **Normalization for `correct`:** strip whitespace; replace quotes and punctuation (including hyphens) with spaces; collapse whitespace; compare with Unicode case-folding. Leading words like “The” are **not** removed: `The Matrix` and `Matrix` are not treated as the same title.
 
 ### Compare experiment results (`compare.py`)
 
-`compare.py` reads DIS-CO result CSVs (same auto-generated names as `run.py`: `{movie}_{source}_{test_type}_{llm}.csv`) and prints a summary table to the terminal. It does **not** write files.
+`compare.py` reads DIS-CO result CSVs (same auto-generated names as `run.py`: `{movie}_{source}_{test_type}_{llm}.csv`) and prints summary tables to the terminal: per-movie LLM comparison, image vs caption for one LLM, or **leaderboard** rankings across all CSVs in a directory. It does **not** write files.
 
 **`--output-dir`** (default: current directory) is where it looks for CSVs.
 
@@ -292,5 +296,30 @@ For cloud backends, `--llm` is the short name (`gemini`, `claude`, `chatgpt`). F
 
 ```bash
 python3 compare.py --compare test --movie "Frozen" --llm chatgpt --source dataset
+```
+
+#### Mode 3: leaderboards (`--compare leaderboard`)
+
+Scans **all** result CSVs in **`--output-dir`** whose names match `{movie}_{source}_{test_type}_{llm}.csv` (movie slug has no underscores; the LLM segment is everything after the third `_`). Optional filters:
+
+- **`--test-type`** `image` or `caption` — **default `image`** for leaderboard if omitted.
+- **`--source`** `local` or `dataset` — **default `dataset`** for leaderboard if omitted.
+
+**`--by model`:** ranks **LLMs** by **overall** accuracy pooled across every matching movie file (also **Main** / **Neutral** breakdown, **Movies** count, **Frames**). Sorted by overall accuracy, highest first.
+
+**`--by movie`:** for a single LLM (**`--llm` required,** as in the filename token), ranks **movies** by overall accuracy (Main / Neutral / Frames). The first non-empty **`movie`** cell in each CSV is used for the display name.
+
+```bash
+# Which LLM is best overall?
+python3 compare.py --compare leaderboard --by model --output-dir /path/to/results
+
+# Which LLM is best at caption testing?
+python3 compare.py --compare leaderboard --by model --test-type caption --output-dir /path/to/results
+
+# Which movies are easiest/hardest for ChatGPT?
+python3 compare.py --compare leaderboard --by movie --llm chatgpt --output-dir /path/to/results
+
+# Which movies for Qwen2-VL (filename token)?
+python3 compare.py --compare leaderboard --by movie --llm qwen-qwen2-vl-7b-instruct --output-dir /path/to/results
 ```
 

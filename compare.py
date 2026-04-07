@@ -88,6 +88,81 @@ def parse_llm_from_stem(stem: str, movie_slug: str, source: str, test_type: str)
     return stem[len(prefix) :] or None
 
 
+def parse_result_csv_stem(stem: str) -> tuple[str, str, str, str] | None:
+    """Parse `{movie}_{source}_{test_type}_{llm}` (movie slug has no underscores)."""
+    parts = stem.split("_")
+    if len(parts) < 4:
+        return None
+    source = parts[1]
+    test_type = parts[2]
+    if source not in ("local", "dataset"):
+        return None
+    if test_type not in ("image", "caption"):
+        return None
+    movie_slug = parts[0]
+    llm = "_".join(parts[3:])
+    return movie_slug, source, test_type, llm
+
+
+def aggregate_metrics_from_paths(paths: list[Path]) -> Metrics:
+    """Pool rows from multiple CSVs into one Metrics (same weighting as one combined file)."""
+    main_total = main_correct = 0
+    neutral_total = neutral_correct = 0
+    total = 0
+    correct_count = 0
+    errors = 0
+
+    for path in paths:
+        with path.open(newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                total += 1
+                llm_resp = row.get("llm_response") or ""
+                if llm_resp.startswith("ERROR:"):
+                    errors += 1
+
+                is_correct = (row.get("correct") or "").strip() == "True"
+                if is_correct:
+                    correct_count += 1
+
+                ft = (row.get("frame_type") or "").strip()
+                if ft == "Main":
+                    main_total += 1
+                    if is_correct:
+                        main_correct += 1
+                elif ft == "Neutral":
+                    neutral_total += 1
+                    if is_correct:
+                        neutral_correct += 1
+
+    overall_pct = 100.0 * correct_count / total if total else 0.0
+    main_pct = 100.0 * main_correct / main_total if main_total else 0.0
+    neutral_pct = 100.0 * neutral_correct / neutral_total if neutral_total else 0.0
+
+    return Metrics(
+        overall_pct=overall_pct,
+        main_pct=main_pct,
+        neutral_pct=neutral_pct,
+        frames=total,
+        errors=errors,
+    )
+
+
+def read_movie_display_name(path: Path) -> str:
+    """First non-empty ``movie`` cell in CSV, else movie slug from filename."""
+    try:
+        with path.open(newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                m = (row.get("movie") or "").strip()
+                if m:
+                    return m
+    except OSError:
+        pass
+    parsed = parse_result_csv_stem(path.stem)
+    return parsed[0] if parsed else path.stem
+
+
 def compare_llm(args: argparse.Namespace) -> None:
     out_dir = Path(args.output_dir).resolve()
     movie_slug = slug_movie(args.movie)
@@ -194,6 +269,108 @@ def compare_test(args: argparse.Namespace) -> None:
     )
 
 
+def compare_leaderboard(args: argparse.Namespace) -> None:
+    out_dir = Path(args.output_dir).resolve()
+    source = args.source
+    test_type = args.test_type
+    assert source is not None and test_type is not None
+
+    pattern = f"*_{source}_{test_type}_*.csv"
+    paths = sorted(p for p in out_dir.glob(pattern) if p.is_file())
+    paths = [p for p in paths if parse_result_csv_stem(p.stem) is not None]
+
+    if not paths:
+        print(
+            f"No result CSVs matching *_{source}_{test_type}_*.csv in {out_dir}. "
+            "Run experiments first with run.py."
+        )
+        return
+
+    if args.by == "model":
+        llm_to_paths: dict[str, list[Path]] = {}
+        for p in paths:
+            parsed = parse_result_csv_stem(p.stem)
+            if not parsed:
+                continue
+            _movie, src, tt, llm = parsed
+            if src != source or tt != test_type:
+                continue
+            llm_to_paths.setdefault(llm, []).append(p)
+
+        rows: list[tuple[str, Metrics, int]] = []
+        for llm, ps in sorted(llm_to_paths.items()):
+            m = aggregate_metrics_from_paths(sorted(ps))
+            n_movies = len(ps)
+            rows.append((llm, m, n_movies))
+
+        rows.sort(key=lambda x: (-x[1].overall_pct, x[0]))
+
+        title = f"Model Leaderboard (all movies, {test_type} test)"
+        print(title)
+        print("=" * len(title))
+        w_rank, w_ov, w_main, w_neu, w_mov, w_fr = 4, 7, 6, 7, 6, 6
+        w_llm = max(18, max(len(llm) for llm, _, _ in rows))
+        print(
+            f"{'Rank':<{w_rank}}| {'LLM':<{w_llm}}| {'Overall':>{w_ov}} | "
+            f"{'Main':>{w_main}} | {'Neutral':>{w_neu}} | {'Movies':>{w_mov}} | {'Frames':>{w_fr}}"
+        )
+        sep = (
+            f"{'-' * w_rank}|{'-' * w_llm}|{'-' * (w_ov + 2)}|"
+            f"{'-' * (w_main + 2)}|{'-' * (w_neu + 2)}|{'-' * (w_mov + 2)}|{'-' * (w_fr + 2)}"
+        )
+        print(sep)
+        for rank, (llm, m, n_movies) in enumerate(rows, start=1):
+            print(
+                f"{rank:<{w_rank}}| {llm:<{w_llm}}| {fmt_pct(m.overall_pct):>{w_ov}} | "
+                f"{fmt_pct(m.main_pct):>{w_main}} | {fmt_pct(m.neutral_pct):>{w_neu}} | "
+                f"{n_movies:>{w_mov}} | {m.frames:>{w_fr}}"
+            )
+        return
+
+    # --by movie
+    llm_tok = llm_filename_token(args.llm)
+    movie_rows: list[tuple[str, Metrics]] = []
+    for p in paths:
+        parsed = parse_result_csv_stem(p.stem)
+        if not parsed:
+            continue
+        _movie_slug, src, tt, llm = parsed
+        if src != source or tt != test_type or llm != llm_tok:
+            continue
+        m = compute_metrics(p)
+        display = read_movie_display_name(p)
+        movie_rows.append((display, m))
+
+    if not movie_rows:
+        print(
+            f"No result CSVs for LLM '{llm_tok}' matching *_{source}_{test_type}_{llm_tok}.csv "
+            f"in {out_dir}. Run experiments first with run.py."
+        )
+        return
+
+    movie_rows.sort(key=lambda x: (-x[1].overall_pct, x[0].lower()))
+
+    title = f"Movie Leaderboard ({llm_tok}, {test_type} test)"
+    print(title)
+    print("=" * len(title))
+    w_rank, w_ov, w_main, w_neu, w_fr = 4, 7, 6, 7, 6
+    w_mov = max(18, max(len(name) for name, _ in movie_rows))
+    print(
+        f"{'Rank':<{w_rank}}| {'Movie':<{w_mov}}| {'Overall':>{w_ov}} | "
+        f"{'Main':>{w_main}} | {'Neutral':>{w_neu}} | {'Frames':>{w_fr}}"
+    )
+    sep = (
+        f"{'-' * w_rank}|{'-' * w_mov}|{'-' * (w_ov + 2)}|"
+        f"{'-' * (w_main + 2)}|{'-' * (w_neu + 2)}|{'-' * (w_fr + 2)}"
+    )
+    print(sep)
+    for rank, (name, m) in enumerate(movie_rows, start=1):
+        print(
+            f"{rank:<{w_rank}}| {name:<{w_mov}}| {fmt_pct(m.overall_pct):>{w_ov}} | "
+            f"{fmt_pct(m.main_pct):>{w_main}} | {fmt_pct(m.neutral_pct):>{w_neu}} | {m.frames:>{w_fr}}"
+        )
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Compare DIS-CO CSV results (unified {movie}_{source}_{test_type}_{llm}.csv naming)."
@@ -201,14 +378,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--compare",
         required=True,
-        choices=["llm", "test"],
-        help="llm: compare LLMs for same movie/source/test-type; test: image vs caption for same LLM.",
+        choices=["llm", "test", "leaderboard"],
+        help="llm: compare LLMs for same movie/source/test-type; test: image vs caption for same LLM; "
+        "leaderboard: ranked summary across all result CSVs in --output-dir.",
+    )
+    p.add_argument(
+        "--by",
+        choices=["model", "movie"],
+        default=None,
+        help='With --compare leaderboard: "model" ranks LLMs overall; "movie" ranks movies for one LLM (needs --llm).',
     )
     p.add_argument(
         "--movie",
-        required=True,
+        required=False,
+        default=None,
         type=str,
-        help='Human-readable movie name (e.g. "Frozen", "Forrest Gump").',
+        help='Human-readable movie name (e.g. "Frozen", "Forrest Gump"). Required for --compare llm and test.',
     )
     p.add_argument(
         "--output-dir",
@@ -220,33 +405,49 @@ def parse_args() -> argparse.Namespace:
         "--test-type",
         choices=["image", "caption"],
         default=None,
-        help='For --compare llm: "image" or "caption".',
+        help='Required for --compare llm. For --compare leaderboard defaults to "image" if omitted.',
     )
     p.add_argument(
         "--source",
         choices=["local", "dataset"],
         default=None,
-        help='For both modes: "local" or "dataset".',
+        help='Required for --compare llm and test. For --compare leaderboard defaults to "dataset" if omitted.',
     )
     p.add_argument(
         "--llm",
         type=str,
         default=None,
-        help="For --compare test: LLM token as in filename (e.g. chatgpt, or qwen-qwen2-vl-7b-instruct).",
+        help="For --compare test: LLM token as in filename. For --compare leaderboard --by movie: required.",
     )
 
     args = p.parse_args()
 
+    if args.by is not None and args.compare != "leaderboard":
+        p.error("--by is only valid with --compare leaderboard.")
+
     if args.compare == "llm":
+        if args.movie is None:
+            p.error("--movie is required when --compare llm.")
         if args.test_type is None:
             p.error("--test-type is required when --compare llm.")
         if args.source is None:
             p.error("--source is required when --compare llm.")
     elif args.compare == "test":
+        if args.movie is None:
+            p.error("--movie is required when --compare test.")
         if args.llm is None:
             p.error("--llm is required when --compare test.")
         if args.source is None:
             p.error("--source is required when --compare test.")
+    elif args.compare == "leaderboard":
+        if args.by is None:
+            p.error('--by is required when --compare leaderboard ("model" or "movie").')
+        if args.by == "movie" and args.llm is None:
+            p.error("--llm is required when --compare leaderboard --by movie.")
+        if args.test_type is None:
+            args.test_type = "image"
+        if args.source is None:
+            args.source = "dataset"
 
     return args
 
@@ -255,8 +456,10 @@ def main() -> None:
     args = parse_args()
     if args.compare == "llm":
         compare_llm(args)
-    else:
+    elif args.compare == "test":
         compare_test(args)
+    else:
+        compare_leaderboard(args)
 
 
 if __name__ == "__main__":
