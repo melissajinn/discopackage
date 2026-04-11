@@ -1000,14 +1000,16 @@ def run_dataset(
             from vllm import LLM
 
             assert vllm_model is not None
-            _, _, num_gpus = _vllm_parallel_plan(vllm_model)
-            print(f"vLLM: using tensor parallelism across {num_gpus} GPU(s)")
+            _, gpus_needed, num_gpus = _vllm_parallel_plan(vllm_model)
+            print(
+                f"vLLM: using {gpus_needed} GPU(s) (tensor parallel) out of {num_gpus} available"
+            )
             vllm_instance = LLM(
                 model=vllm_model,
                 max_model_len=4096,
                 limit_mm_per_prompt={"image": 1},
                 trust_remote_code=True,
-                tensor_parallel_size=num_gpus,
+                tensor_parallel_size=gpus_needed,
             )
 
         resume = n_done > 0
@@ -1049,14 +1051,16 @@ def run_dataset(
             from vllm import LLM
 
             assert vllm_model is not None
-            _, _, num_gpus = _vllm_parallel_plan(vllm_model)
-            print(f"vLLM: using tensor parallelism across {num_gpus} GPU(s)")
+            _, gpus_needed, num_gpus = _vllm_parallel_plan(vllm_model)
+            print(
+                f"vLLM: using {gpus_needed} GPU(s) (tensor parallel) out of {num_gpus} available"
+            )
             vllm_instance = LLM(
                 model=vllm_model,
                 max_model_len=4096,
                 limit_mm_per_prompt={"image": 1},
                 trust_remote_code=True,
-                tensor_parallel_size=num_gpus,
+                tensor_parallel_size=gpus_needed,
             )
 
         for mi, (movie_name, movie_indices, out_path, remaining) in enumerate(movie_jobs, start=1):
