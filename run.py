@@ -215,21 +215,46 @@ def _chunk_round_robin(items: list[Any], num_chunks: int) -> list[list[Any]]:
     return chunks
 
 
-def _vllm_parallel_plan(vllm_model: str) -> tuple[int, int, int]:
-    """Return (num_workers, gpus_needed, num_gpus) for vLLM auto parallelism."""
+def _vllm_parallel_plan(vllm_model: str) -> tuple[int, int, int, list[int]]:
+    """Return (num_workers, gpus_needed, num_gpus, free_gpus) for vLLM auto parallelism.
+
+    - num_gpus: total visible GPUs (per torch).
+    - free_gpus: subset of visible GPUs with enough free memory to safely schedule work.
+    """
     import torch
 
     num_gpus = torch.cuda.device_count()
-    if num_gpus <= 0:
-        num_gpus = 1
+    if num_gpus <= 0 or not torch.cuda.is_available():
+        # CPU-only fallback so the rest of the script can still run (vLLM will fail later).
+        return 1, 1, 1, [0]
+
+    # Filter to only GPUs with enough free memory to avoid grabbing GPUs in use by others.
+    # Note: This is a best-effort heuristic; CUDA memory reporting can be noisy.
+    MIN_FREE_GB = 20.0
+    free_gpus: list[int] = []
+    try:
+        for i in range(num_gpus):
+            free_bytes, _total_bytes = torch.cuda.mem_get_info(i)
+            free_gb = free_bytes / (1024**3)
+            if free_gb >= MIN_FREE_GB:
+                free_gpus.append(i)
+    except Exception:  # noqa: BLE001
+        # If querying memory fails, fall back to "all visible GPUs".
+        free_gpus = list(range(num_gpus))
+
+    if not free_gpus:
+        free_gpus = [0]
+
     gpus_needed = estimate_gpus_needed(vllm_model)
-    gpus_needed = max(1, min(gpus_needed, num_gpus))
-    if gpus_needed >= num_gpus:
-        # Tensor parallel across all available GPUs
-        return 1, gpus_needed, num_gpus
+    gpus_needed = max(1, min(gpus_needed, len(free_gpus)))
+
+    if gpus_needed >= len(free_gpus):
+        # Tensor parallel across all eligible GPUs
+        return 1, gpus_needed, num_gpus, free_gpus
+
     # Data parallel: multiple workers, each a TP group of size gpus_needed
-    num_workers = max(1, num_gpus // gpus_needed)
-    return num_workers, gpus_needed, num_gpus
+    num_workers = max(1, len(free_gpus) // gpus_needed)
+    return num_workers, gpus_needed, num_gpus, free_gpus
 
 
 def _merge_tmp_csvs(final_path: Path, tmp_paths: list[Path], *, resume: bool) -> None:
@@ -335,6 +360,84 @@ def _run_local_vllm_worker(
                 writer.writerow([m_name, f_type, frame_path.name, "vllm", caption, llm_response, str(correct)])
             else:
                 writer.writerow([m_name, f_type, frame_path.name, "vllm", llm_response, str(correct)])
+
+
+def _run_dataset_vllm_worker(
+    gpu_ids: list[int],
+    row_indices: list[int],
+    dataset_name: str,
+    vllm_model_name: str,
+    tp_size: int,
+    tmp_csv: str,
+    caption_mode_flag: bool,
+) -> None:
+    """Worker for vLLM dataset-mode data parallelism (single-movie path)."""
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
+    from datasets import load_dataset
+    from vllm import LLM
+
+    ds = load_dataset(dataset_name, split="train")
+    if caption_mode_flag:
+        ds = ds.remove_columns(["Image_File"])
+
+    llm_instance = LLM(
+        model=vllm_model_name,
+        max_model_len=4096,
+        limit_mm_per_prompt={"image": 1},
+        trust_remote_code=True,
+        tensor_parallel_size=tp_size,
+    )
+
+    image_prompt = "What movie is this frame from? Reply with only the movie title, nothing else."
+    with Path(tmp_csv).open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if caption_mode_flag:
+            writer.writerow(["movie", "frame_type", "frame_file", "llm", "caption", "llm_response", "correct"])
+        else:
+            writer.writerow(["movie", "frame_type", "frame_file", "llm", "llm_response", "correct"])
+
+        for idx, row_idx in enumerate(row_indices, start=1):
+            row = ds[row_idx]
+            movie = row.get("Movie", "")
+            frame_type = row.get("Frame_Type", "")
+            frame_file = dataset_row_frame_file(row)
+            print(f"[worker gpu={gpu_ids}] {idx}/{len(row_indices)} {frame_file}")
+
+            caption = ""
+            if caption_mode_flag:
+                raw_cap = row.get("Caption")
+                if not raw_cap or not str(raw_cap).strip():
+                    caption = "ERROR: Missing or empty Caption."
+                    llm_response = "ERROR: caption step failed"
+                    correct = False
+                else:
+                    caption = str(raw_cap).strip()
+                    guess_prompt = guess_from_caption_prompt(caption)
+                    llm_response, guess_err = call_vllm_text(guess_prompt, llm_instance)
+                    correct = False if guess_err else is_correct_response(llm_response, movie)
+            else:
+                image = row.get("Image_File")
+                if image is None:
+                    llm_response = "ERROR: Missing image."
+                    correct = False
+                else:
+                    try:
+                        img = _row_image_to_pil(image)
+                        llm_response, had_error = call_vllm(
+                            image_prompt,
+                            img,
+                            vllm_model_name,
+                            llm_instance,
+                        )
+                        correct = False if had_error else is_correct_response(llm_response, movie)
+                    except Exception as e:  # noqa: BLE001
+                        llm_response = f"ERROR: {e}"
+                        correct = False
+
+            if caption_mode_flag:
+                writer.writerow([movie, frame_type, frame_file, "vllm", caption, llm_response, str(correct)])
+            else:
+                writer.writerow([movie, frame_type, frame_file, "vllm", llm_response, str(correct)])
 
 
 def encode_image_to_base64(img: Image.Image) -> str:
@@ -686,14 +789,14 @@ def run_local(
     # vLLM: auto decide tensor parallelism vs data parallelism
     if llm == "vllm":
         assert vllm_model is not None
-        num_workers, gpus_needed, num_gpus = _vllm_parallel_plan(vllm_model)
-        if gpus_needed >= num_gpus:
+        num_workers, gpus_needed, num_gpus, free_gpus = _vllm_parallel_plan(vllm_model)
+        if gpus_needed >= len(free_gpus):
             print(
-                f"vLLM: model needs {gpus_needed} GPU(s), using tensor parallelism across {num_gpus} GPU(s)"
+                f"vLLM: model needs {gpus_needed} GPU(s), using tensor parallelism across {len(free_gpus)} eligible GPU(s)"
             )
         else:
             print(
-                f"vLLM: model fits on {gpus_needed} GPU(s), launching {num_workers} data-parallel workers across {num_gpus} GPU(s)"
+                f"vLLM: model fits on {gpus_needed} GPU(s), launching {num_workers} data-parallel workers across {len(free_gpus)} eligible GPU(s)"
             )
 
         if num_workers > 1:
@@ -705,7 +808,7 @@ def run_local(
             gpu_groups: list[list[int]] = []
             for w in range(num_workers):
                 start = w * gpus_needed
-                gpu_groups.append(list(range(start, start + gpus_needed)))
+                gpu_groups.append(free_gpus[start : start + gpus_needed])
 
             with tempfile.TemporaryDirectory(prefix="disco_vllm_local_", dir=str(output.parent)) as td:
                 tmp_paths: list[Path] = []
@@ -737,12 +840,15 @@ def run_local(
         from vllm import LLM
 
         assert vllm_model is not None
+        # Use tensor parallelism across eligible GPUs in the current process.
+        _, gpus_needed, _num_gpus, free_gpus = _vllm_parallel_plan(vllm_model)
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in free_gpus[:gpus_needed])
         vllm_instance = LLM(
             model=vllm_model,
             max_model_len=4096,
             limit_mm_per_prompt={"image": 1},
             trust_remote_code=True,
-            tensor_parallel_size=num_gpus,
+            tensor_parallel_size=gpus_needed,
         )
 
     image_prompt = "What movie is this frame from? Reply with only the movie title, nothing else."
@@ -997,13 +1103,52 @@ def run_dataset(
             print(f"Found existing results: {n_done}/{total} frames already processed. Resuming...")
 
         if llm == "vllm":
+            assert vllm_model is not None
+            num_workers, gpus_needed, num_gpus, free_gpus = _vllm_parallel_plan(vllm_model)
+            if num_workers > 1:
+                chunks = _chunk_round_robin(remaining_indices, num_workers)
+                gpu_groups: list[list[int]] = []
+                for w in range(num_workers):
+                    start = w * gpus_needed
+                    gpu_groups.append(free_gpus[start : start + gpus_needed])
+
+                dataset_name = "DIS-CO/MovieTection_Mini" if model_size == "mini" else "DIS-CO/MovieTection"
+                with tempfile.TemporaryDirectory(prefix="disco_vllm_ds_", dir=str(output_dir)) as td:
+                    tmp_paths: list[Path] = []
+                    procs: list[mp.Process] = []
+                    ctx = mp.get_context("spawn")
+                    for wi, (gpu_ids, chunk) in enumerate(zip(gpu_groups, chunks, strict=False)):
+                        tmp = Path(td) / f"worker_{wi}.csv"
+                        tmp_paths.append(tmp)
+                        p = ctx.Process(
+                            target=_run_dataset_vllm_worker,
+                            args=(
+                                gpu_ids,
+                                chunk,
+                                dataset_name,
+                                vllm_model,
+                                gpus_needed,
+                                str(tmp),
+                                caption_mode,
+                            ),
+                        )
+                        p.start()
+                        procs.append(p)
+
+                    for p in procs:
+                        p.join()
+                    bad = [p.exitcode for p in procs if p.exitcode not in (0, None)]
+                    if bad:
+                        raise RuntimeError(f"vLLM worker(s) failed: exit codes={bad}")
+                    _merge_tmp_csvs(output_file, tmp_paths, resume=n_done > 0)
+                return
+
             from vllm import LLM
 
-            assert vllm_model is not None
-            _, gpus_needed, num_gpus = _vllm_parallel_plan(vllm_model)
             print(
-                f"vLLM: using {gpus_needed} GPU(s) (tensor parallel) out of {num_gpus} available"
+                f"vLLM: using {gpus_needed} GPU(s) (tensor parallel) out of {num_gpus} visible; eligible={len(free_gpus)}"
             )
+            os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in free_gpus[:gpus_needed])
             vllm_instance = LLM(
                 model=vllm_model,
                 max_model_len=4096,
@@ -1051,10 +1196,11 @@ def run_dataset(
             from vllm import LLM
 
             assert vllm_model is not None
-            _, gpus_needed, num_gpus = _vllm_parallel_plan(vllm_model)
+            _, gpus_needed, num_gpus, free_gpus = _vllm_parallel_plan(vllm_model)
             print(
-                f"vLLM: using {gpus_needed} GPU(s) (tensor parallel) out of {num_gpus} available"
+                f"vLLM: using {gpus_needed} GPU(s) (tensor parallel) out of {num_gpus} visible; eligible={len(free_gpus)}"
             )
+            os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in free_gpus[:gpus_needed])
             vllm_instance = LLM(
                 model=vllm_model,
                 max_model_len=4096,
