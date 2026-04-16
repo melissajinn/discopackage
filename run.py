@@ -270,6 +270,9 @@ def _merge_tmp_csvs(final_path: Path, tmp_paths: list[Path], *, resume: bool) ->
         out_wrote_header = resume and final_path.exists()
         w = csv.writer(out_f)
         for p in tmp_paths:
+            if not p.exists():
+                # Skip workers that crashed before writing their CSV.
+                continue
             with p.open(newline="", encoding="utf-8") as in_f:
                 r = csv.reader(in_f)
                 try:
