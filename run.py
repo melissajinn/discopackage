@@ -244,6 +244,9 @@ def _vllm_parallel_plan(vllm_model: str) -> tuple[int, int, int, list[int]]:
 
     if not free_gpus:
         free_gpus = [0]
+    print(
+        f"[vllm_parallel_plan] Free GPUs (>={MIN_FREE_GB}GB free): {free_gpus} out of {num_gpus} total"
+    )
 
     gpus_needed = estimate_gpus_needed(vllm_model)
     gpus_needed = max(1, min(gpus_needed, len(free_gpus)))
@@ -829,12 +832,14 @@ def run_local(
                 for p in procs:
                     p.join()
 
-                bad = [p.exitcode for p in procs if p.exitcode not in (0, None)]
-                if bad:
-                    raise RuntimeError(f"One or more vLLM worker processes failed: exit codes={bad}")
-
                 resume = n_done > 0
                 _merge_tmp_csvs(output, tmp_paths, resume=resume)
+                bad = [p.exitcode for p in procs if p.exitcode not in (0, None)]
+                if bad:
+                    print(
+                        f"Warning: {len(bad)} vLLM worker(s) failed (exit codes={bad}), "
+                        "but merged results from successful workers."
+                    )
             return
 
     vllm_instance: Any = None
@@ -1139,10 +1144,13 @@ def run_dataset(
 
                     for p in procs:
                         p.join()
+                    _merge_tmp_csvs(output_file, tmp_paths, resume=n_done > 0)
                     bad = [p.exitcode for p in procs if p.exitcode not in (0, None)]
                     if bad:
-                        raise RuntimeError(f"vLLM worker(s) failed: exit codes={bad}")
-                    _merge_tmp_csvs(output_file, tmp_paths, resume=n_done > 0)
+                        print(
+                            f"Warning: {len(bad)} vLLM worker(s) failed (exit codes={bad}), "
+                            "but merged results from successful workers."
+                        )
                 return
 
             from vllm import LLM
