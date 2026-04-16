@@ -230,7 +230,7 @@ def _vllm_parallel_plan(vllm_model: str) -> tuple[int, int, int, list[int]]:
 
     # Filter to only GPUs with enough free memory to avoid grabbing GPUs in use by others.
     # Note: This is a best-effort heuristic; CUDA memory reporting can be noisy.
-    MIN_FREE_GB = 20.0
+    MIN_FREE_GB = 14.0
     free_gpus: list[int] = []
     try:
         for i in range(num_gpus):
@@ -297,6 +297,7 @@ def _run_local_vllm_worker(
         max_model_len=4096,
         limit_mm_per_prompt={"image": 1},
         trust_remote_code=True,
+        gpu_memory_utilization=0.85,
         tensor_parallel_size=tp_size,
     )
 
@@ -385,6 +386,7 @@ def _run_dataset_vllm_worker(
         max_model_len=4096,
         limit_mm_per_prompt={"image": 1},
         trust_remote_code=True,
+        gpu_memory_utilization=0.85,
         tensor_parallel_size=tp_size,
     )
 
